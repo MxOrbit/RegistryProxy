@@ -38,6 +38,10 @@ function getConfig() {
     routes: { ...ROUTE_TABLE, ...customRoutes },
     blockedUA,
     authUrl: process.env.AUTH_URL || 'https://auth.docker.io',
+    // AUTH_MODE: 'passthrough' (不做认证) 或 'basic' (Basic Auth 终止认证)
+    authMode: (process.env.AUTH_MODE || 'passthrough').toLowerCase(),
+    authUser: process.env.AUTH_USER || '',
+    authPass: process.env.AUTH_PASS || '',
   };
 }
 

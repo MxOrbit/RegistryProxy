@@ -34,6 +34,9 @@ docker run -d -p 3000:3000 registry-proxy
 | `UPSTREAM` | `registry-1.docker.io` | 单一模式下的上游地址 |
 | `AUTH_URL` | `https://auth.docker.io` | Docker 认证服务器 |
 | `BLOCKED_UA` | `netcraft` | 屏蔽的 User-Agent（逗号/空格分隔） |
+| `AUTH_MODE` | `passthrough` | `passthrough` 不做认证 / `basic` 终止认证 |
+| `AUTH_USER` | - | Basic Auth 用户名（`AUTH_MODE=basic` 时必填） |
+| `AUTH_PASS` | - | Basic Auth 密码（`AUTH_MODE=basic` 时必填） |
 | `ROUTES` | - | 自定义路由表 JSON，`MODE=route` 时生效 |
 
 ## 使用方式

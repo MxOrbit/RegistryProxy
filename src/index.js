@@ -3,12 +3,16 @@
 const express = require('express');
 const { handleRegistryProxy } = require('./proxy');
 const { getConfig } = require('./config');
+const { basicAuth } = require('./auth');
 
 const app = express();
 const config = getConfig();
 
-// 健康检查
+// 健康检查（在 auth 之前）
 app.get('/healthz', (_req, res) => res.send('ok'));
+
+// Basic Auth 中间件
+app.use(basicAuth(config));
 
 // 主路由
 app.all('*', async (req, res) => {
@@ -34,6 +38,7 @@ const PORT = config.port;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Registry Proxy listening on port ${PORT}`);
   console.log(`Mode: ${config.mode}`);
+  console.log(`Auth: ${config.authMode}`);
   if (config.mode === 'single') {
     console.log(`Upstream: ${config.upstream}`);
   } else {
