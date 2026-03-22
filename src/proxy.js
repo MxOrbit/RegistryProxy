@@ -31,13 +31,17 @@ async function handleRegistryProxy(req, res, config) {
     search = parsed.search;
   }
 
-  // Token 请求 -> 转发到 auth.docker.io
+  // Token 请求 -> 转发到对应的 auth 服务
   if (pathname.includes('/token')) {
-    const tokenUrl = `${config.authUrl}${pathname}${search}`;
+    const tokenUrl = isDockerHub
+      ? `${config.authUrl}${pathname}${search}`
+      : `https://${hubHost}${pathname}${search}`;
+    const tokenHost = isDockerHub ? 'auth.docker.io' : hubHost;
     const upstream = await fetch(tokenUrl, {
-      headers: buildUpstreamHeaders(req, 'auth.docker.io'),
+      headers: buildUpstreamHeaders(req, tokenHost),
     });
-    return pipeResponse(upstream, res, selfUrl, config.authUrl);
+    const tokenAuthUrl = isDockerHub ? config.authUrl : `https://${hubHost}`;
+    return pipeResponse(upstream, res, selfUrl, tokenAuthUrl);
   }
 
   // 对 Docker Hub 的请求，自动补 library/ 前缀
@@ -47,11 +51,10 @@ async function handleRegistryProxy(req, res, config) {
 
   // manifests/blobs/tags 请求：先获取 token 再请求
   if (
-    isDockerHub &&
     pathname.startsWith('/v2/') &&
     (pathname.includes('/manifests/') || pathname.includes('/blobs/') || pathname.includes('/tags/'))
   ) {
-    return handleAuthenticatedRequest(req, res, fetch, hubHost, pathname, search, config, selfUrl);
+    return handleAuthenticatedRequest(req, res, fetch, hubHost, pathname, search, config, selfUrl, isDockerHub);
   }
 
   // 普通请求直接转发
@@ -71,13 +74,30 @@ async function handleRegistryProxy(req, res, config) {
     redirect: 'manual',
   });
 
+  // 对非 Docker Hub registry，如果返回 401，尝试自动获取 token 重试
+  if (!isDockerHub && upstream.status === 401) {
+    const wwwAuth = upstream.headers.get('www-authenticate');
+    if (wwwAuth) {
+      const token = await fetchTokenFromChallenge(fetch, wwwAuth, req);
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+        const retryRes = await fetch(targetUrl, {
+          method: req.method,
+          headers,
+          redirect: 'manual',
+        });
+        return pipeResponse(retryRes, res, selfUrl, `https://${hubHost}`, req, hubHost, fetch);
+      }
+    }
+  }
+
   return pipeResponse(upstream, res, selfUrl, config.authUrl, req, hubHost, fetch);
 }
 
 /**
  * 处理需要认证的请求（manifests/blobs/tags）
  */
-async function handleAuthenticatedRequest(req, res, fetch, hubHost, pathname, search, config, selfUrl) {
+async function handleAuthenticatedRequest(req, res, fetch, hubHost, pathname, search, config, selfUrl, isDockerHub) {
   // 提取镜像名
   const v2Match = pathname.match(/^\/v2\/(.+?)(?:\/(manifests|blobs|tags)\/)/);
   if (!v2Match) {
@@ -92,16 +112,35 @@ async function handleAuthenticatedRequest(req, res, fetch, hubHost, pathname, se
   }
 
   const repo = v2Match[1];
-  const tokenUrl = `${config.authUrl}/token?service=registry.docker.io&scope=repository:${repo}:pull`;
-  const tokenRes = await fetch(tokenUrl, {
-    headers: buildUpstreamHeaders(req, 'auth.docker.io'),
-  });
-  const tokenData = await tokenRes.json();
-  const token = tokenData.token;
+  let token;
+
+  if (isDockerHub) {
+    // Docker Hub: 直接从 auth.docker.io 获取 token
+    const tokenUrl = `${config.authUrl}/token?service=registry.docker.io&scope=repository:${repo}:pull`;
+    const tokenRes = await fetch(tokenUrl, {
+      headers: buildUpstreamHeaders(req, 'auth.docker.io'),
+    });
+    const tokenData = await tokenRes.json();
+    token = tokenData.token;
+  } else {
+    // 非 Docker Hub registry: 先请求获取 WWW-Authenticate challenge，再获取 token
+    const probeUrl = `https://${hubHost}/v2/`;
+    const probeRes = await fetch(probeUrl, {
+      method: 'GET',
+      headers: buildUpstreamHeaders(req, hubHost),
+      redirect: 'manual',
+    });
+    const wwwAuth = probeRes.headers.get('www-authenticate');
+    if (wwwAuth) {
+      token = await fetchTokenFromChallenge(fetch, wwwAuth, req, repo);
+    }
+  }
 
   const targetUrl = `https://${hubHost}${pathname}${search}`;
   const headers = buildUpstreamHeaders(req, hubHost);
-  headers['Authorization'] = `Bearer ${token}`;
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
 
   if (req.headers['x-amz-content-sha256']) {
     headers['X-Amz-Content-Sha256'] = req.headers['x-amz-content-sha256'];
@@ -114,6 +153,44 @@ async function handleAuthenticatedRequest(req, res, fetch, hubHost, pathname, se
   });
 
   return pipeResponse(upstream, res, selfUrl, config.authUrl, req, hubHost, fetch);
+}
+
+/**
+ * 解析 WWW-Authenticate challenge 并获取 Bearer token
+ * 支持格式: Bearer realm="https://...",service="...",scope="..."
+ */
+async function fetchTokenFromChallenge(fetch, wwwAuth, req, repoOverride) {
+  const bearerMatch = wwwAuth.match(/Bearer\s+(.*)/i);
+  if (!bearerMatch) return null;
+
+  const params = {};
+  const paramRegex = /(\w+)="([^"]+)"/g;
+  let m;
+  while ((m = paramRegex.exec(bearerMatch[1])) !== null) {
+    params[m[1]] = m[2];
+  }
+
+  if (!params.realm) return null;
+
+  const tokenUrl = new URL(params.realm);
+  if (params.service) tokenUrl.searchParams.set('service', params.service);
+  // 如果有实际的 repo 名，始终用它构造 scope（challenge 里的 scope 可能是占位符）
+  if (repoOverride) {
+    tokenUrl.searchParams.set('scope', `repository:${repoOverride}:pull`);
+  } else if (params.scope) {
+    tokenUrl.searchParams.set('scope', params.scope);
+  }
+
+  try {
+    const tokenRes = await fetch(tokenUrl.toString(), {
+      headers: buildUpstreamHeaders(req, tokenUrl.hostname),
+    });
+    if (!tokenRes.ok) return null;
+    const data = await tokenRes.json();
+    return data.token || data.access_token || null;
+  } catch {
+    return null;
+  }
 }
 
 /**
