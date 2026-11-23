@@ -36,13 +36,12 @@ RUN rustup target add \
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+RUN cargo fetch --locked
 
 ENV CARGO_TARGET_DIR=/target
 
 ARG TARGETPLATFORM
-RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
-    --mount=type=cache,id=target-${TARGETPLATFORM},target=/target \
+RUN --mount=type=cache,id=target-${TARGETPLATFORM},target=/target \
     set -eu; \
     case "$TARGETPLATFORM" in \
       linux/amd64) rust_target=x86_64-unknown-linux-musl ;; \
@@ -51,7 +50,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
       linux/arm64|linux/arm64/v8) rust_target=aarch64-unknown-linux-musl ;; \
       *) echo "unsupported platform: $TARGETPLATFORM" >&2; exit 1 ;; \
     esac; \
-    cargo zigbuild --release --locked --target "$rust_target"; \
+    cargo zigbuild --release --frozen --target "$rust_target"; \
     install -D "/target/${rust_target}/release/registry-proxy" /out/registry-proxy
 
 FROM scratch
