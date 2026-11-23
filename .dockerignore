@@ -1,7 +1,12 @@
-node_modules
+target/
 .git
+.gitignore
 .github
+.idea
+.vscode
 *.md
-docker-compose.yml
-.dockerignore
 .env
+.env.*
+docker-compose.yml
+Dockerfile
+.dockerignore

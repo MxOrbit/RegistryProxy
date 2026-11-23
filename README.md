@@ -2,7 +2,7 @@
 
 [![Dockerhub](https://img.shields.io/docker/pulls/mmx233/registry-proxy)](https://hub.docker.com/repository/docker/mmx233/registry-proxy)
 
-自托管的轻量 Docker Registry 镜像代理服务。
+自托管的轻量 Docker Registry 镜像代理服务，使用 Rust 编写，镜像基于 `scratch`，只包含一个静态二进制。
 
 ## 快速开始
 
@@ -40,6 +40,7 @@ docker run -d -p 3000:3000 registry-proxy
 | `AUTH_USER`  | -                        | Basic Auth 用户名（`AUTH_MODE=basic` 时必填） |
 | `AUTH_PASS`  | -                        | Basic Auth 密码（`AUTH_MODE=basic` 时必填）  |
 | `ROUTES`     | -                        | 自定义路由表 JSON，`MODE=route` 时生效          |
+| `RUST_LOG`   | `info`                   | 日志级别，如 `debug`、`warn`                  |
 
 ## 使用方式
 
@@ -80,6 +81,15 @@ sudo systemctl restart docker
 
 可通过 `ROUTES` 环境变量扩展路由表。
 
+### `ns` 参数
+
+containerd 等客户端配置镜像加速时会在请求上附带 `?ns=<registry>`，代理按它选择上游。
+`ns` 只能是 Docker Hub（`docker.io`）、`UPSTREAM` 或路由表中的 registry，其他值返回 `403`，避免被当作开放代理。
+
+## 健康检查
+
+`GET /healthz` 返回 `ok`，不需要认证。镜像内没有 shell，请使用编排平台的 HTTP 健康检查，而不是在容器内执行命令。
+
 ## 反向代理
 
 Nginx
@@ -106,4 +116,15 @@ server {
         proxy_request_buffering off;
     }
 }
+```
+
+代理会读取 `X-Forwarded-Proto`，用于生成返回给客户端的认证地址，HTTPS 反向代理时请保留这一行。
+
+## 本地开发
+
+需要 Rust 工具链（版本由 `rust-toolchain.toml` 固定）。
+
+```bash
+cargo run
+cargo test
 ```
