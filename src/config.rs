@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 pub const DOCKER_HUB: &str = "registry-1.docker.io";
 
@@ -43,6 +43,23 @@ impl AuthMode {
 }
 
 #[derive(Clone, Debug)]
+pub struct CacheConfig {
+    pub dir: PathBuf,
+    pub threshold: Option<Threshold>,
+    pub ttl: Option<Duration>,
+    pub gc_interval: Duration,
+}
+
+/// `CACHE_GC_THRESHOLD`: collection starts above `high` and removes blobs down to `low`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Threshold {
+    /// Total size of the cached blobs, in bytes.
+    Bytes { low: u64, high: u64 },
+    /// Usage of the file system holding `CACHE_DIR`, in percent.
+    Percent { low: f64, high: f64 },
+}
+
+#[derive(Clone, Debug)]
 pub struct Config {
     pub port: u16,
     pub mode: Mode,
@@ -51,6 +68,7 @@ pub struct Config {
     pub blocked_ua: Vec<String>,
     pub auth_url: String,
     pub auth: AuthMode,
+    pub cache: Option<CacheConfig>,
     /// Scheme used to reach upstream registries. Always `https` in production;
     /// integration tests switch it to `http` to talk to local mock servers.
     pub upstream_scheme: String,
@@ -133,6 +151,23 @@ impl Config {
             }
         };
 
+        let cache = match var("CACHE_DIR") {
+            None => None,
+            Some(dir) => Some(CacheConfig {
+                dir: PathBuf::from(dir),
+                threshold: var("CACHE_GC_THRESHOLD")
+                    .map(|raw| parse_threshold(&raw))
+                    .transpose()?,
+                ttl: var("CACHE_TTL")
+                    .map(|raw| parse_duration("CACHE_TTL", &raw))
+                    .transpose()?,
+                gc_interval: match var("CACHE_GC_INTERVAL") {
+                    Some(raw) => parse_duration("CACHE_GC_INTERVAL", &raw)?,
+                    None => Duration::from_secs(300),
+                },
+            }),
+        };
+
         Ok(Config {
             port,
             mode,
@@ -141,6 +176,7 @@ impl Config {
             blocked_ua,
             auth_url,
             auth,
+            cache,
             upstream_scheme: "https".to_string(),
         })
     }
@@ -215,6 +251,80 @@ fn validate_host(name: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `low:high` or a single value used for both; both sides are sizes or both are percentages.
+fn parse_threshold(raw: &str) -> Result<Threshold, String> {
+    let invalid = || format!("invalid CACHE_GC_THRESHOLD {raw:?}");
+    let (low, high) = raw.split_once(':').unwrap_or((raw, raw));
+    let threshold = match (low.strip_suffix('%'), high.strip_suffix('%')) {
+        (Some(low), Some(high)) => Threshold::Percent {
+            low: parse_percent(low).ok_or_else(invalid)?,
+            high: parse_percent(high).ok_or_else(invalid)?,
+        },
+        (None, None) => Threshold::Bytes {
+            low: parse_size(low).ok_or_else(invalid)?,
+            high: parse_size(high).ok_or_else(invalid)?,
+        },
+        _ => return Err(invalid()),
+    };
+    let ordered = match threshold {
+        Threshold::Bytes { low, high } => low <= high,
+        Threshold::Percent { low, high } => low <= high,
+    };
+    if ordered {
+        Ok(threshold)
+    } else {
+        Err(invalid())
+    }
+}
+
+fn parse_percent(raw: &str) -> Option<f64> {
+    raw.parse::<f64>()
+        .ok()
+        .filter(|value| (0.0..=100.0).contains(value))
+}
+
+/// A positive byte count, optionally with a `Ki`, `Mi`, `Gi` or `Ti` suffix.
+fn parse_size(raw: &str) -> Option<u64> {
+    let split = raw.find(|c: char| !c.is_ascii_digit()).unwrap_or(raw.len());
+    let (digits, unit) = raw.split_at(split);
+    let shift = match unit {
+        "" => 0,
+        "Ki" => 10,
+        "Mi" => 20,
+        "Gi" => 30,
+        "Ti" => 40,
+        _ => return None,
+    };
+    digits
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(1 << shift)
+        .filter(|&size| size > 0)
+}
+
+/// A positive integer followed by one of `s`, `m`, `h` or `d`.
+fn parse_duration(name: &str, raw: &str) -> Result<Duration, String> {
+    let invalid = || format!("invalid {name} {raw:?}, expected e.g. 30s, 5m, 12h or 7d");
+    let unit_secs = match raw.bytes().last() {
+        Some(b's') => 1,
+        Some(b'm') => 60,
+        Some(b'h') => 3600,
+        Some(b'd') => 86400,
+        _ => return Err(invalid()),
+    };
+    let digits = &raw[..raw.len() - 1];
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|count| count.checked_mul(unit_secs))
+        .filter(|&secs| secs > 0)
+        .map(Duration::from_secs)
+        .ok_or_else(invalid)
+}
+
 /// Strips the port from a Host header value, keeping bracketed IPv6 literals intact.
 fn hostname(host: &str) -> &str {
     match host.rfind(':') {
@@ -246,6 +356,139 @@ mod tests {
         assert_eq!(config.blocked_ua, vec!["netcraft"]);
         assert_eq!(config.routes.len(), DEFAULT_ROUTES.len());
         assert_eq!(config.upstream_scheme, "https");
+        assert!(config.cache.is_none());
+    }
+
+    #[test]
+    fn parses_cache_settings() {
+        let cache = config(&[("CACHE_DIR", "/var/cache/registry")])
+            .unwrap()
+            .cache
+            .unwrap();
+        assert_eq!(cache.dir, PathBuf::from("/var/cache/registry"));
+        assert_eq!(cache.threshold, None);
+        assert_eq!(cache.ttl, None);
+        assert_eq!(cache.gc_interval, Duration::from_secs(300));
+
+        let cache = config(&[
+            ("CACHE_DIR", "/cache"),
+            ("CACHE_GC_THRESHOLD", "80Gi:100Gi"),
+            ("CACHE_TTL", "7d"),
+            ("CACHE_GC_INTERVAL", "30s"),
+        ])
+        .unwrap()
+        .cache
+        .unwrap();
+        assert_eq!(
+            cache.threshold,
+            Some(Threshold::Bytes {
+                low: 80 << 30,
+                high: 100 << 30
+            })
+        );
+        assert_eq!(cache.ttl, Some(Duration::from_secs(7 * 86400)));
+        assert_eq!(cache.gc_interval, Duration::from_secs(30));
+
+        assert!(config(&[("CACHE_TTL", "bogus")]).unwrap().cache.is_none());
+    }
+
+    #[test]
+    fn parses_gc_thresholds() {
+        for (raw, expected) in [
+            (
+                "1000",
+                Threshold::Bytes {
+                    low: 1000,
+                    high: 1000,
+                },
+            ),
+            (
+                "2Ki:1Mi",
+                Threshold::Bytes {
+                    low: 2048,
+                    high: 1 << 20,
+                },
+            ),
+            (
+                "1Ti",
+                Threshold::Bytes {
+                    low: 1 << 40,
+                    high: 1 << 40,
+                },
+            ),
+            (
+                "90%:95%",
+                Threshold::Percent {
+                    low: 90.0,
+                    high: 95.0,
+                },
+            ),
+            (
+                "92.5%",
+                Threshold::Percent {
+                    low: 92.5,
+                    high: 92.5,
+                },
+            ),
+            (
+                "0%:100%",
+                Threshold::Percent {
+                    low: 0.0,
+                    high: 100.0,
+                },
+            ),
+        ] {
+            assert_eq!(parse_threshold(raw), Ok(expected), "{raw}");
+        }
+        for raw in [
+            "",
+            "0",
+            "0:10",
+            "10:0",
+            "95%:90%",
+            "90%:100Gi",
+            "100Gi:95%",
+            "101%",
+            "-1%",
+            "nan%",
+            "10G",
+            "10gi",
+            "1.5Gi",
+            "+10",
+            " 10",
+            "10:",
+            ":10",
+            "1:2:3",
+            "abc",
+            "1000:abc",
+        ] {
+            assert!(parse_threshold(raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn parses_durations() {
+        for (raw, secs) in [("30s", 30), ("5m", 300), ("12h", 43200), ("7d", 604_800)] {
+            assert_eq!(
+                parse_duration("X", raw),
+                Ok(Duration::from_secs(secs)),
+                "{raw}"
+            );
+        }
+        for raw in [
+            "", "s", "h", "0s", "0d", "10", "1w", "abc", "1h30m", "1.5h", "+5m", "-5m", "5 m",
+            "5M", "5日",
+        ] {
+            assert!(parse_duration("X", raw).is_err(), "{raw}");
+        }
+        assert!(parse_duration("X", "99999999999999999999d").is_err());
+        for vars in [
+            &[("CACHE_DIR", "/c"), ("CACHE_TTL", "0s")][..],
+            &[("CACHE_DIR", "/c"), ("CACHE_GC_INTERVAL", "1h30m")],
+            &[("CACHE_DIR", "/c"), ("CACHE_GC_THRESHOLD", "95%:90%")],
+        ] {
+            assert!(config(vars).is_err(), "expected error for {vars:?}");
+        }
     }
 
     #[test]

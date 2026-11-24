@@ -24,11 +24,12 @@ async fn main() -> ExitCode {
     let mode = config.mode;
     let auth = config.auth.as_str();
     let upstream = config.upstream.clone();
+    let cache_dir = config.cache.as_ref().map(|cache| cache.dir.clone());
 
     let state = match AppState::new(config) {
         Ok(state) => state,
         Err(err) => {
-            error!("failed to build upstream HTTP client: {err}");
+            error!("{err}");
             return ExitCode::FAILURE;
         }
     };
@@ -47,6 +48,9 @@ async fn main() -> ExitCode {
     match mode {
         Mode::Single => info!("Upstream: {upstream}"),
         Mode::Route => info!("Route mode: routing by subdomain prefix"),
+    }
+    if let Some(dir) = cache_dir {
+        info!("Cache: {}", dir.display());
     }
 
     if let Err(err) = axum::serve(listener, router(state))

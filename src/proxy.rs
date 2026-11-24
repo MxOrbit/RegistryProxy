@@ -1,3 +1,4 @@
+mod cached;
 mod response;
 mod token;
 
@@ -11,7 +12,7 @@ use axum::{
         header::{
             ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, ACCESS_CONTROL_ALLOW_METHODS,
             ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_MAX_AGE, ACCESS_CONTROL_REQUEST_HEADERS,
-            AUTHORIZATION, CACHE_CONTROL, HOST, USER_AGENT, WWW_AUTHENTICATE,
+            AUTHORIZATION, CACHE_CONTROL, HOST, RANGE, USER_AGENT, WWW_AUTHENTICATE,
         },
         request::Parts,
     },
@@ -21,7 +22,7 @@ use reqwest::Url;
 use serde_json::json;
 use tracing::warn;
 
-use crate::{AppState, config::DOCKER_HUB};
+use crate::{AppState, cache::is_digest_hex, config::DOCKER_HUB};
 
 const X_AMZ_CONTENT_SHA256: &str = "x-amz-content-sha256";
 const CONTENT_KINDS: [&str; 3] = ["/manifests/", "/blobs/", "/tags/"];
@@ -83,6 +84,7 @@ struct Proxy<'a> {
     base_headers: HeaderMap,
     authorization: Option<HeaderValue>,
     amz_content_sha256: Option<HeaderValue>,
+    range: bool,
     self_url: String,
 }
 
@@ -96,6 +98,7 @@ impl<'a> Proxy<'a> {
             base_headers: base_headers(&parts.headers),
             authorization: parts.headers.get(AUTHORIZATION).cloned(),
             amz_content_sha256: parts.headers.get(X_AMZ_CONTENT_SHA256).cloned(),
+            range: parts.headers.contains_key(RANGE),
             self_url: self_url(&parts.headers, host),
         }
     }
@@ -142,6 +145,25 @@ impl<'a> Proxy<'a> {
         path: &str,
         query: Option<&str>,
     ) -> Result<Response, UpstreamError> {
+        if let Some(cache) = &self.state.cache
+            && (self.method == Method::GET || self.method == Method::HEAD)
+            && !self.range
+            && is_canonical_target(path, query)
+            && is_routing_only(query)
+            && let Some(hex) = blob_digest(path)
+        {
+            return self.cached_blob(cache, hex, path, query).await;
+        }
+        let (status, headers, upstream) = self.fetch_content(path, query).await?;
+        Ok(self.client_response(status, headers, upstream))
+    }
+
+    /// Requests manifests, blobs and tags with an anonymous pull token, following redirects.
+    async fn fetch_content(
+        &self,
+        path: &str,
+        query: Option<&str>,
+    ) -> Result<(StatusCode, HeaderMap, reqwest::Response), UpstreamError> {
         let url = self.registry_url(path, query)?;
         let Some(repo) = repository(path) else {
             let upstream = self
@@ -153,7 +175,7 @@ impl<'a> Proxy<'a> {
                 )
                 .await?;
             return self
-                .respond(upstream, &self.state.config.auth_url, true)
+                .prepare(upstream, &self.state.config.auth_url, true)
                 .await;
         };
 
@@ -166,7 +188,7 @@ impl<'a> Proxy<'a> {
         let upstream = self
             .send(&self.state.client, self.method.clone(), url, headers)
             .await?;
-        self.respond(upstream, &self.state.config.auth_url, true)
+        self.prepare(upstream, &self.state.config.auth_url, true)
             .await
     }
 
@@ -388,9 +410,73 @@ fn repository(path: &str) -> Option<&str> {
         .map(|index| &rest[..index])
 }
 
+/// The hex digest of `/v2/<repo>/blobs/sha256:<64 lowercase hex>`.
+fn blob_digest(path: &str) -> Option<&str> {
+    let repo = repository(path)?;
+    let hex = path
+        .strip_prefix("/v2/")?
+        .strip_prefix(repo)?
+        .strip_prefix("/blobs/sha256:")?;
+    is_digest_hex(hex).then_some(hex)
+}
+
+/// Whether the query only carries the proxy's own routing keys. Anything else is forwarded
+/// upstream and may authorize the request (e.g. signed URLs), so it must not fill a shared cache.
+/// `;` is rejected because some upstreams split on it where `form_urlencoded` does not.
+fn is_routing_only(query: Option<&str>) -> bool {
+    let query = query.unwrap_or("");
+    !query.contains(';')
+        && form_urlencoded::parse(query.as_bytes()).all(|(key, _)| key == "ns" || key == "hubhost")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_routing_only_queries() {
+        for query in [
+            None,
+            Some(""),
+            Some("ns=docker.io"),
+            Some("ns=quay.io&hubhost=x"),
+        ] {
+            assert!(is_routing_only(query), "{query:?}");
+        }
+        for query in [
+            "ns=quay.io&sig=abc",
+            "X-Amz-Signature=abc",
+            "token",
+            "hubhost=x;sig=abc",
+        ] {
+            assert!(!is_routing_only(Some(query)), "{query}");
+        }
+    }
+
+    #[test]
+    fn extracts_blob_digests() {
+        let hex = "0123456789abcdef".repeat(4);
+        assert_eq!(
+            blob_digest(&format!("/v2/library/nginx/blobs/sha256:{hex}")),
+            Some(hex.as_str())
+        );
+        assert_eq!(
+            blob_digest(&format!("/v2/a/b/c/blobs/sha256:{hex}")),
+            Some(hex.as_str())
+        );
+        for path in [
+            format!("/v2/nginx/blobs/sha256:{}", hex.to_uppercase()),
+            format!("/v2/nginx/blobs/sha256:{hex}0"),
+            format!("/v2/nginx/blobs/sha512:{hex}"),
+            format!("/v2/nginx/blobs/sha256:{hex}/x"),
+            format!("/v2/nginx/manifests/sha256:{hex}"),
+            format!("/v2/nginx/manifests/x/blobs/sha256:{hex}"),
+            format!("/v2/blobs/sha256:{hex}"),
+            "/v2/nginx/blobs/uploads/".to_string(),
+        ] {
+            assert_eq!(blob_digest(&path), None, "{path}");
+        }
+    }
 
     #[test]
     fn detects_token_paths_by_last_segment() {

@@ -34,19 +34,32 @@ impl Proxy<'_> {
         rewrite_from: &str,
         follow_redirects: bool,
     ) -> Result<Response, UpstreamError> {
+        let (status, headers, upstream) = self
+            .prepare(upstream, rewrite_from, follow_redirects)
+            .await?;
+        Ok(self.client_response(status, headers, upstream))
+    }
+
+    /// Status and filtered headers for the client, plus the response whose body they belong to.
+    pub(super) async fn prepare(
+        &self,
+        upstream: reqwest::Response,
+        rewrite_from: &str,
+        follow_redirects: bool,
+    ) -> Result<(StatusCode, HeaderMap, reqwest::Response), UpstreamError> {
         if follow_redirects && let Some(location) = redirect_target(&upstream)? {
             return self.follow(upstream, location).await;
         }
         let mut headers = filtered_headers(upstream.headers());
         rewrite_www_authenticate(&mut headers, rewrite_from, &self.self_url);
-        Ok(self.client_response(upstream.status(), headers, upstream))
+        Ok((upstream.status(), headers, upstream))
     }
 
     async fn follow(
         &self,
         first: reqwest::Response,
         location: Url,
-    ) -> Result<Response, UpstreamError> {
+    ) -> Result<(StatusCode, HeaderMap, reqwest::Response), UpstreamError> {
         let last = self
             .send(
                 &self.state.follow_client,
@@ -58,10 +71,10 @@ impl Proxy<'_> {
         let mut headers = filtered_headers(last.headers());
         copy_missing_docker_headers(first.headers(), &mut headers);
         headers.insert(CACHE_CONTROL, HeaderValue::from_static("max-age=1500"));
-        Ok(self.client_response(last.status(), headers, last))
+        Ok((last.status(), headers, last))
     }
 
-    fn client_response(
+    pub(super) fn client_response(
         &self,
         status: StatusCode,
         mut headers: HeaderMap,

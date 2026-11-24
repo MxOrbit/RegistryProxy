@@ -51,10 +51,12 @@ RUN --mount=type=cache,id=target-${TARGETPLATFORM},target=/target \
       *) echo "unsupported platform: $TARGETPLATFORM" >&2; exit 1 ;; \
     esac; \
     cargo zigbuild --release --frozen --target "$rust_target"; \
-    install -D "/target/${rust_target}/release/registry-proxy" /out/registry-proxy
+    install -D "/target/${rust_target}/release/registry-proxy" /out/registry-proxy; \
+    mkdir -p /out/cache
 
 FROM scratch
 COPY --from=build /out/registry-proxy /registry-proxy
+COPY --from=build --chown=65532:65532 /out/cache /cache
 USER 65532:65532
 EXPOSE 3000
 ENTRYPOINT ["/registry-proxy"]

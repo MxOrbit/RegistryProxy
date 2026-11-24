@@ -10,9 +10,11 @@ use axum::{
 };
 
 mod auth;
+mod cache;
 pub mod config;
 mod proxy;
 
+use cache::Cache;
 use config::AuthMode;
 pub use config::Config;
 
@@ -24,10 +26,13 @@ pub struct AppState {
     /// Upstream client that follows up to 10 redirects, used for blob downloads.
     pub follow_client: reqwest::Client,
     basic_auth: Option<Arc<[u8]>>,
+    cache: Option<Arc<Cache>>,
 }
 
 impl AppState {
-    pub fn new(config: Config) -> reqwest::Result<Self> {
+    /// Builds the upstream clients and, when `CACHE_DIR` is set, prepares the cache
+    /// directory and starts its collection task. Must be called inside a Tokio runtime.
+    pub fn new(config: Config) -> Result<Self, String> {
         Self::with_client_options(config, |builder| builder)
     }
 
@@ -36,21 +41,25 @@ impl AppState {
     pub fn with_client_options(
         config: Config,
         customize: impl Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
-    ) -> reqwest::Result<Self> {
-        let client = customize(http_client_builder()?.redirect(reqwest::redirect::Policy::none()))
-            .build()?;
-        let follow_client =
-            customize(http_client_builder()?.redirect(reqwest::redirect::Policy::limited(10)))
-                .build()?;
+    ) -> Result<Self, String> {
+        let build = |policy| {
+            http_client_builder()
+                .and_then(|builder| customize(builder.redirect(policy)).build())
+                .map_err(|err| format!("failed to build upstream HTTP client: {err}"))
+        };
+        let client = build(reqwest::redirect::Policy::none())?;
+        let follow_client = build(reqwest::redirect::Policy::limited(10))?;
         let basic_auth = match &config.auth {
             AuthMode::Basic { user, pass } => Some(Arc::from(auth::expected_header(user, pass))),
             AuthMode::Passthrough => None,
         };
+        let cache = config.cache.as_ref().map(Cache::open).transpose()?;
         Ok(AppState {
             config: Arc::new(config),
             client,
             follow_client,
             basic_auth,
+            cache,
         })
     }
 }
